@@ -12,7 +12,7 @@ The _raw_ unprocessed data are not included in this archive due to size; for an 
 
 There are four files in this folder:
 
-- `DuneFront_WP4.2_predictors_v1.3_sandy.gpkg`: a geopackage file containing site information. Each "site" is a 1 km^2^ grid cell from the [GHSL](https://human-settlement.emergency.copernicus.eu/) rasters, converted into polygon. Only coastal sandy polygons were kept (for how we defined "sandy" and "coastal", see deliverable report). For each polygon, a series of relevant environmental variables are included; again see deliverable report.
+- `DuneFront_WP4.2_predictors_v1.3_sandy.gpkg`: a geopackage file containing site information. Each "site" is a 1 km² grid cell from the [GHSL](https://human-settlement.emergency.copernicus.eu/) rasters, converted into polygon. Only coastal sandy polygons were kept (for how we defined "sandy" and "coastal", see deliverable report). For each polygon, a series of relevant environmental variables are included; again see deliverable report.
 
 -  `DuneFront_WP4.2_formatted_occurrences_classicalSDM.csv`: a `csv file` containing for each sandy site (IDed by the combination of `row_index` and `col_index`, which refers to `DuneFront_WP4.2_predictors_v1.3_sandy.gpkg`) and information on whether a focal species was recorded or not during the 2015-2024 decade of interest (`[genus]_[species]` columns). Only sites in which at least one of the focal species was recorded is included. In addition of columns describing whether a focal species was recorded, the table included columns `list_length` (number of species seen at this site) and `N_observations` (number of records of any species);
 
