@@ -1,0 +1,183 @@
+---
+title: "occupancy detection models"
+format: html
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r load-packages}
+library(brms)
+library(flocker)
+library(sf)
+library(tidyverse)
+library(here)
+
+options(mc.cores = 4)
+```
+
+```{r import-occurrences}
+occurrences <- read_csv(here("data", "DuneFront_WP4.2_formatted_occurrences_occdet.csv")) |>
+  mutate(list_length_factor = case_when(
+    list_length == 1 ~ "1",
+    list_length > 1 & list_length < 4 ~ "2_3",
+    TRUE ~ "4_more"
+  )) |>
+  arrange(year, month, day)
+```
+
+```{r import-site-info}
+gridcells <- read_sf(here("data", "DuneFront_WP4.2_predictors_v1.3_sandy.gpkg")) |>
+  as_tibble() |>
+  mutate(
+    urban = case_when(
+      distance_to_UC == 0 ~ "03_UC",
+      distance_to_DUC == 0 ~ "02_DUC",
+      TRUE ~ "01_non_urban"
+    ),
+    site = paste(row_index, col_index, sep = "_")
+  ) |>
+  select(row_index, col_index, site, urban, ECO_NAME, ECO_ID, BIOME_NAME, BIOME_NUM)
+```
+
+We prepare a species list to iterate through
+
+```{r species-list}
+species_list <- occurrences |>
+  select(Calamagrostis_arenaria:Rosa_rugosa) |>
+  pivot_longer(everything(), names_to = "species") |>
+  group_by(species) |>
+  summarise(Nrecords = sum(value))
+
+species_list |>
+  print(n = Inf)
+
+# except C baltica, all species fall over the 50 records threshold suggested in Outhwaite
+
+species_list_valid <- species_list |>
+  filter(Nrecords > 50)
+
+species_list_valid |>
+  print(n = Inf)
+```
+
+The two non-native species _Carpobrotus edulis_ and _C. acinaciformis_ can sometimes be confused (the former is sometimes misidentified as the latter), and also hybridize. While we present results in the deliverable report for the two species as recorded, we propose additional maps for both combined
+
+```{r carpobrotus-complex}
+occurrences$Carpobrotus_complex <- (occurrences$Carpobrotus_acinaciformis | occurrences$Carpobrotus_edulis)
+```
+
+# prepping data
+
+And we choose here the focal species for this run. Because of how long the code takes (about 1-2 hours per species from this point), we don't automatically iterate, but re-run for each species manually instead.
+
+```{r focal-species}
+focal_species <- species_list_valid$species[19] ## !! to change for each run!!!
+focal_species <- "Carpobrotus_complex" # or set manually instead # this has to be the way for Carpobrotus_complex
+focal_species
+```
+
+flocker uses a quite special data format where all sites must have values for all visits, even if NA (which is OK)... but where all the NA must be trailing!!
+That is, if we have one site with history 0-NA-1-1 (non-detected, non-visited, detected, detected), and one with NA-1-NA-1, then the visit histories _must_ be stored as 0-1-1-NA and 1-1-NA-NA, with visit-level covariates correspondingly sorted.
+
+This is not trivial, so we need the bit of dark magic below to make that work
+
+```{r here-lies-dark-magic}
+tab_multi <- occurrences |>
+  mutate(detected := !!sym(focal_species),
+    focal_species = focal_species
+  ) |>
+  mutate(detected = as.numeric(detected)) |>
+  group_by(row_index, col_index, year, focal_species) |>
+  nest() |>
+  ungroup() |>
+  mutate(vector_length = map(.x = data, .f = function(.x) {
+    dim(.x)[1]
+  })) |>
+  unnest(vector_length) |>
+  mutate(max_vector = max(vector_length)) |>
+  mutate(
+    observations = map2(
+      .y = max_vector, .x = data,
+      .f = function(.x, .y) {
+        mm <- .x$detected
+        length(mm) <- .y
+        matrix(mm, nrow = 1, ncol = .y)
+      }
+    ),
+    list_length_factor = map2(
+      .y = max_vector, .x = data,
+      .f = function(.x, .y) {
+        mm <- .x$list_length_factor
+        length(mm) <- .y
+        matrix(mm, nrow = 1, ncol = .y)
+      }
+    )
+  ) |>
+  left_join(gridcells) |>
+  group_by(site) |>
+  mutate(Nyears = length(unique(year))) |>
+  ungroup()
+```
+
+```{r check-multiyear}
+tab_multi |>
+  select(site, Nyears) |>
+  distinct() |>
+  count(Nyears)
+```
+
+We follow Outhwaite et al in only keeping sites visited at least two years, so that the year and site effects are estimable
+(alternative approaches could for instance assuming the entire decade is one closure period, allowing us to keep all records and simplifying model structure; preliminary tests show that it doesn't change much here, and doesn't even make models run that much faster)
+
+```{r multi-year-filter}
+tab_multi <- tab_multi |>
+  filter(Nyears > 1)
+```
+
+## Doing the model
+
+We use the `make_flocker_data()` function to convert the data into the format suitable for flocker
+
+```{r make-data}
+fdata_multi <- make_flocker_data(
+  obs = tab_multi |> select(observations) |> unnest(observations) |> as.matrix(),
+  unit_covs = tab_multi |> select(focal_species, urban, year, site, ECO_NAME, ECO_ID, BIOME_NAME, BIOME_NUM),
+  event_covs = list(
+    ll = tab_multi |> select(list_length_factor) |> unnest(list_length_factor) |> as.matrix()
+  ),
+  type = "single"
+)
+```
+
+```{r check-prior}
+get_flocker_prior(
+  f_occ = ~ urban + (1 | BIOME_NUM) + (1 | ECO_ID) + (1 | site) + (1 | year),
+  f_det = ~ll,
+  ## we follow outhwaite in ignoring phenology for convergence time purposes, and privileging the discrete version of LL
+  flocker_data = fdata_multi
+)
+```
+
+```{r fit-model}
+mod <- flock(
+  f_occ = ~ urban + (1 | BIOME_NUM) + (1 | ECO_ID) + (1 | site) + (1 | year),
+  f_det = ~ll,
+  flocker_data = fdata_multi,
+  seed = 42,
+  iter = 2000,
+  control = list(adapt_delta = 0.8),
+  prior = c(
+    set_prior("normal(0,1.5)", class = "Intercept"), # default prior is for detectability
+    set_prior("normal(0,1)", class = "b"),
+    set_prior("normal(0,1.5)", class = "Intercept", dpar = "occ"), # occupancy
+    set_prior("normal(0,1)", class = "b", dpar = "occ"),
+    set_prior("normal(0,1)", class = "sd", dpar = "occ")
+  ),
+  backend = "cmdstanr" # flocker doc uses rstan by default, but there is sometimes issues
+)
+```
+
+
+```{r save-model}
+saveRDS(mod, here("output", "occupancy_models", paste("occ", focal_species, "multiyear.RDS", sep = "_")))
+```

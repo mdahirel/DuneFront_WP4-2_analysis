@@ -1,0 +1,89 @@
+---
+title: "making no-analog map"
+format: html
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r}
+library(sf)
+library(tidyverse)
+library(here)
+```
+
+
+```{r}
+gridcells <- read_sf(here("data", "DuneFront_WP4_2_predictors_v1_3_sandysubset.gpkg"))
+```
+
+```{r}
+no_analog <- gridcells |> 
+  mutate(
+    no_analog_tas_2041_ssp126 = 
+      (CHELSA_bio1_2041_ssp126 > max(CHELSA_tas)) | (CHELSA_bio1_2041_ssp126 < min(CHELSA_tas)),
+    no_analog_tas_2041_ssp370 = 
+      (CHELSA_bio1_2041_ssp370 > max(CHELSA_tas)) | (CHELSA_bio1_2041_ssp370 < min(CHELSA_tas)),
+    no_analog_tas_2041_ssp585 = 
+      (CHELSA_bio1_2041_ssp585 > max(CHELSA_tas)) | (CHELSA_bio1_2041_ssp585 < min(CHELSA_tas)),
+    no_analog_tas_2071_ssp126 = 
+      (CHELSA_bio1_2071_ssp126 > max(CHELSA_tas)) | (CHELSA_bio1_2071_ssp126 < min(CHELSA_tas)),
+    no_analog_tas_2071_ssp370 = 
+      (CHELSA_bio1_2071_ssp370 > max(CHELSA_tas)) | (CHELSA_bio1_2071_ssp370 < min(CHELSA_tas)),
+    no_analog_tas_2071_ssp585 = 
+      (CHELSA_bio1_2071_ssp585 > max(CHELSA_tas)) | (CHELSA_bio1_2071_ssp585 < min(CHELSA_tas)),
+    no_analog_tasmax_2041_ssp126 = 
+      (CHELSA_bio5_2041_ssp126 > max(CHELSA_tasmax)) | (CHELSA_bio5_2041_ssp126 < min(CHELSA_tasmax)),
+    no_analog_tasmax_2041_ssp370 = 
+      (CHELSA_bio5_2041_ssp370 > max(CHELSA_tasmax)) | (CHELSA_bio5_2041_ssp370 < min(CHELSA_tasmax)),
+    no_analog_tasmax_2041_ssp585 = 
+      (CHELSA_bio5_2041_ssp585 > max(CHELSA_tasmax)) | (CHELSA_bio5_2041_ssp585 < min(CHELSA_tasmax)),
+    no_analog_tasmax_2071_ssp126 = 
+      (CHELSA_bio5_2071_ssp126 > max(CHELSA_tasmax)) | (CHELSA_bio5_2071_ssp126 < min(CHELSA_tasmax)),
+    no_analog_tasmax_2071_ssp370 = 
+      (CHELSA_bio5_2071_ssp370 > max(CHELSA_tasmax)) | (CHELSA_bio5_2071_ssp370 < min(CHELSA_tasmax)),
+    no_analog_tasmax_2071_ssp585 = 
+      (CHELSA_bio5_2071_ssp585 > max(CHELSA_tasmax)) | (CHELSA_bio5_2071_ssp585 < min(CHELSA_tasmax)),
+    no_analog_tasmin_2041_ssp126 = 
+      (CHELSA_bio6_2041_ssp126 > max(CHELSA_tasmin)) | (CHELSA_bio6_2041_ssp126 < min(CHELSA_tasmin)),
+    no_analog_tasmin_2041_ssp370 = 
+      (CHELSA_bio6_2041_ssp370 > max(CHELSA_tasmin)) | (CHELSA_bio6_2041_ssp370 < min(CHELSA_tasmin)),
+    no_analog_tasmin_2041_ssp585 = 
+      (CHELSA_bio6_2041_ssp585 > max(CHELSA_tasmin)) | (CHELSA_bio6_2041_ssp585 < min(CHELSA_tasmin)),
+    no_analog_tasmin_2071_ssp126 = 
+      (CHELSA_bio6_2071_ssp126 > max(CHELSA_tasmin)) | (CHELSA_bio6_2071_ssp126 < min(CHELSA_tasmin)),
+    no_analog_tasmin_2071_ssp370 = 
+      (CHELSA_bio6_2071_ssp370 > max(CHELSA_tasmin)) | (CHELSA_bio6_2071_ssp370 < min(CHELSA_tasmin)),
+    no_analog_tasmin_2071_ssp585 = 
+      (CHELSA_bio6_2071_ssp585 > max(CHELSA_tasmin)) | (CHELSA_bio6_2071_ssp585 < min(CHELSA_tasmin)),
+    no_analog_pr_2041_ssp126 = 
+      (CHELSA_bio12_2041_ssp126 > max(CHELSA_pr)) | (CHELSA_bio12_2041_ssp126 < min(CHELSA_pr)),
+    no_analog_pr_2041_ssp370 = 
+      (CHELSA_bio12_2041_ssp370 > max(CHELSA_pr)) | (CHELSA_bio12_2041_ssp370 < min(CHELSA_pr)),
+    no_analog_pr_2041_ssp585 = 
+      (CHELSA_bio12_2041_ssp585 > max(CHELSA_pr)) | (CHELSA_bio12_2041_ssp585 < min(CHELSA_pr)),
+    no_analog_pr_2071_ssp126 = 
+      (CHELSA_bio12_2071_ssp126 > max(CHELSA_pr)) | (CHELSA_bio12_2071_ssp126 < min(CHELSA_pr)),
+    no_analog_pr_2071_ssp370 = 
+      (CHELSA_bio12_2071_ssp370 > max(CHELSA_pr)) | (CHELSA_bio12_2071_ssp370 < min(CHELSA_pr)),
+    no_analog_pr_2071_ssp585 = 
+      (CHELSA_bio12_2071_ssp585 > max(CHELSA_pr)) | (CHELSA_bio12_2071_ssp585 < min(CHELSA_pr))
+  ) |> 
+  select(starts_with("no_analog"),geom) |> 
+  mutate(
+    no_analog_any_2041_ssp126 = no_analog_tas_2041_ssp126 | no_analog_tasmax_2041_ssp126 | no_analog_tasmin_2041_ssp126 | no_analog_pr_2041_ssp126,
+    no_analog_any_2041_ssp370 = no_analog_tas_2041_ssp370 | no_analog_tasmax_2041_ssp370 | no_analog_tasmin_2041_ssp370 | no_analog_pr_2041_ssp370,
+    no_analog_any_2041_ssp585 = no_analog_tas_2041_ssp585 | no_analog_tasmax_2041_ssp585 | no_analog_tasmin_2041_ssp585 | no_analog_pr_2041_ssp585,
+    no_analog_any_2071_ssp126 = no_analog_tas_2071_ssp126 | no_analog_tasmax_2071_ssp126 | no_analog_tasmin_2071_ssp126 | no_analog_pr_2071_ssp126,
+    no_analog_any_2071_ssp370 = no_analog_tas_2071_ssp370 | no_analog_tasmax_2071_ssp370 | no_analog_tasmin_2071_ssp370 | no_analog_pr_2071_ssp370,
+    no_analog_any_2071_ssp585 = no_analog_tas_2071_ssp585 | no_analog_tasmax_2071_ssp585 | no_analog_tasmin_2071_ssp585 | no_analog_pr_2071_ssp585,
+    .before = 0
+  )
+```
+
+```{r}
+write_sf(
+  no_analog,
+  here("output","BART-maps","DuneFront-WP4_no-analog_maps.gpkg")
+)
+```
+

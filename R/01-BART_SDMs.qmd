@@ -1,0 +1,599 @@
+---
+title: "BART_SDMs"
+format: html
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r load-packages}
+library(USE)         # [github::danddr/USE] v0.1.5
+library(terra)       # CRAN v1.8-21
+library(sf)          # CRAN v1.0-19
+
+library(tidymodels)  # CRAN v1.2.0
+library(tidysdm)     # CRAN v1.0.0
+
+library(dbarts)      # CRAN v0.9-30
+library(embarcadero) # [github::cjcarlson/embarcadero] v1.2.0.1003
+
+library(tidyverse)   # CRAN v2.0.0
+library(here)        # CRAN v1.0.1
+
+library(conflicted)  # CRAN v1.2.0
+```
+
+```{r solve-conflicts}
+conflicted::conflict_prefer_all(winner = "dplyr", quiet = TRUE)
+```
+
+# Data preparation
+
+We first start by loading the data. See README in `data` for details.
+
+```{r load-data}
+occurrences <- read_csv(here("data", "DuneFront_WP4.2_formatted_occurrences_classicalSDM.csv")) |>
+  mutate_if(is.logical, as.numeric)
+
+gridcells <- read_sf(here("data", "DuneFront_WP4.2_predictors_v1.3_sandy.gpkg")) |>
+  mutate(
+    coastal_orientation = atan2(sin_coastal_orientation, cos_coastal_orientation),
+    distance_to_DUC = distance_to_DUC / 1000,
+    distance_to_UC = distance_to_UC / 1000
+  ) |>
+  rowwise() |>
+  mutate(distance_to_cities = min(distance_to_DUC, distance_to_UC)) |>
+  ungroup()
+```
+
+We combine the two datasets. This generates NAs in sites where none of the focal species were recorded, which we convert to 0
+
+```{r combine-data}
+tab <- left_join(gridcells, occurrences) |>
+  mutate(across(Calamagrostis_arenaria:N_observations, ~ replace_na(., 0)))
+```
+
+We load the custom function we use to generate pseudo-absences
+
+```{r load-USEfunction}
+source(here("R", "select_pseudo_absences_USE.R"))
+```
+
+We create a table that links variable short names to their longer detailed explanation
+
+```{r rosetta}
+rosetta <- tibble(
+  predictors = c(
+    "CHELSA_tas", "CHELSA_tasmin", "CHELSA_tasmax", "CHELSA_pr", "CHELSA_sfcWind", "CHELSA_sfcWindmax",
+    "distance_closest", "coastal_orientation", "shoreline_trend",
+    "ss_100yr", "wave_height", "wave_period",
+    "tide_range", "highest_astro_tide"
+  ),
+  full_name = c(
+    "avg. daily temperature", "avg. min. temperature of coldest month", "avg. max. temperature of warmest month", "annual precipitation",
+    "avg. wind speed", "avg. wind speed of windiest month",
+    "distance to closest shore", "coastal orientation",
+    "shoreline trend",
+    "100-year return storm surge",
+    "wave height", "wave period",
+    "tide range", "highest astronomical tide"
+  )
+)
+```
+
+We prepare a species list to iterate through
+
+```{r species-list}
+species_list <- occurrences |>
+  select(Calamagrostis_arenaria:Rosa_rugosa) |>
+  pivot_longer(everything(), names_to = "species") |>
+  group_by(species) |>
+  summarise(Nsites = sum(value))
+
+species_list |>
+  print(n = Inf)
+
+species_list_valid <- species_list |>
+  filter(Nsites > 50) # remove species with not enough records; can adjust
+
+species_list_valid |>
+  print(n = Inf)
+```
+
+The two non-native species _Carpobrotus edulis_ and _C. acinaciformis_ can sometimes be confused (the former is sometimes misidentified as the latter), and also hybridize. While we present results in the deliverable report for the two species as recorded, we propose additional maps for both combined
+
+```{r carpobrotus-complex}
+tab$Carpobrotus_complex <- as.numeric(tab$Carpobrotus_acinaciformis | tab$Carpobrotus_edulis)
+```
+
+
+And we choose the focal species for this run. Because of how long the code takes (about 1-2 hours per species from this point), we don't automatically iterate, but re-run for each species manually instead.
+
+```{r focal-species}
+focal_species <- species_list_valid$species[1] ## !! to change for each run!!!
+focal_species <- "Carpobrotus_complex" # or set manually instead # this has to be the way for Carpobrotus_complex
+print(focal_species)
+```
+
+# BART model
+
+## create pseudo-absences
+
+We use an environmentally informed approach to select pseudo absence (https://doi.org/10.1111/2041-210X.14209). 
+For BART, we set to have a roughly 50/50 split between presence and pseudo-absences
+To streamline this, we combined the steps in a custom function:
+
+```{r prep-data-bart}
+## a random subset of non-occurrence as pseudo absences (can be changed later)
+prepped_data <- prep_data_bart(
+  data = tab,
+  Yvar = focal_species,
+  Xvars = rosetta$predictors,
+  biasvar = "distance_to_cities",
+  threshold = 50
+)
+
+tab_bart <- prepped_data$result
+
+prepped_data$PCA_var # shows the cumulative proportion of variance explained by PC axes
+# the USE paper recommends 70% for the first 2, here we usually get around 60%, but we'll consider that good enough
+```
+
+## test/train assignment
+
+We split data into training and testing sets in a stratified way (separately for presence and pseudo-absence)
+
+```{r test-train-split}
+set.seed(42)
+
+splits <- rsample::initial_split(tab_bart, prop = 0.8, strata = detection)
+
+
+bart_training <- rsample::training(splits)
+bart_testing <- rsample::testing(splits)
+```
+
+
+## full model
+
+```{r full-model}
+set.seed(42)
+full_sdm <- dbarts::bart(
+  y.train = bart_training$detection,
+  x.train = bart_training |> select(any_of(rosetta$predictors), distance_to_cities),
+  x.test = bart_testing |> select(any_of(rosetta$predictors), distance_to_cities),
+  nchain = 4,
+  keeptrees = TRUE
+)
+
+
+summary(full_sdm)
+invisible(full_sdm$fit$state) # a known step that's needed to guarantee proper saving, see e.g. the README @ https://github.com/cjcarlson/embarcadero
+```
+
+## reduced model
+
+```{r variable-selection}
+variable_step <- embarcadero::variable.step(
+  y.data = bart_training$detection,
+  x.data = bart_training |> select(any_of(rosetta$predictors), distance_to_cities)
+)
+```
+
+```{r reduced model}
+set.seed(42)
+step_sdm <- dbarts::bart(
+  y.train = bart_training$detection,
+  x.train = bart_training |> select(any_of(variable_step)),
+  x.test = bart_testing |> select(any_of(variable_step)),
+  nchain = 4,
+  keeptrees = TRUE
+)
+
+summary(step_sdm)
+invisible(step_sdm$fit$state)
+```
+
+## evaluating the models
+
+For both training and testing data, we extract a bunch of useful performance metrics, which we then save as csv
+
+```{r performance0}
+model_perf_0 <- tibble(
+  model_type = c("reduced", "unreduced"),
+  model = list(step_sdm, full_sdm),
+  training_truth = list(bart_training$detection, bart_training$detection),
+  testing_truth = list(bart_testing$detection, bart_testing$detection)
+) |>
+  mutate(
+    training_N = map(.x = training_truth, .f = function(.x) {
+      length(.x)
+    }),
+    testing_N = map(.x = testing_truth, .f = function(.x) {
+      length(.x)
+    })
+  ) |>
+  unnest(c(training_N, testing_N)) |>
+  mutate(focal_species = focal_species, .before = 0) |>
+  mutate(
+    training_posterior_probit = map(
+      .x = model,
+      .f = function(.x) {
+        .x$yhat.train
+      }
+    ),
+    testing_posterior_probit = map(
+      .x = model,
+      .f = function(.x) {
+        .x$yhat.test
+      }
+    )
+  ) |>
+  mutate(threshold = map(
+    .x = model,
+    .f = function(.x) {
+      ss <- summary(.x)
+      ss[[3]]$data |> filter(tss == max(tss))
+    }
+    ## saving the embarcadero::summary() gives access to the internal gg patchwork; the tss threshold is encoded in the 3rd plot
+  ))
+```
+
+
+```{r performance1}
+model_perf <- model_perf_0 |>
+  mutate(
+    training_meanpred = map(
+      .x = training_posterior_probit,
+      .f = function(.x) {
+        pnorm(colMeans(.x))
+      }
+    ),
+    testing_meanpred = map(
+      .x = testing_posterior_probit,
+      .f = function(.x) {
+        pnorm(colMeans(.x))
+      }
+    )
+  ) |>
+  mutate(
+    training_thresholded = map2(
+      .x = training_meanpred, .y = threshold,
+      .f = function(.x, .y) {
+        as.numeric(.x > .y$alpha[1])
+      }
+    ),
+    testing_thresholded = map2(
+      .x = testing_meanpred, .y = threshold, ## we need to threshold based on the threshold defined in training to avoid leakage
+      .f = function(.x, .y) {
+        as.numeric(.x > .y$alpha[1])
+      }
+    )
+  ) |>
+  mutate(
+    training_sensitivity = map2(
+      .x = training_truth,
+      .y = training_thresholded,
+      .f = function(.x, .y) {
+        sensitivity_vec(truth = factor(.x), estimate = factor(.y), event_level = "second")
+      }
+    ),
+    training_specificity = map2(
+      .x = training_truth,
+      .y = training_thresholded,
+      .f = function(.x, .y) {
+        specificity_vec(truth = factor(.x), estimate = factor(.y), event_level = "second")
+      }
+    ),
+    testing_sensitivity = map2(
+      .x = testing_truth,
+      .y = testing_thresholded,
+      .f = function(.x, .y) {
+        sensitivity_vec(truth = factor(.x), estimate = factor(.y), event_level = "second")
+      }
+    ),
+    testing_specificity = map2(
+      .x = testing_truth,
+      .y = testing_thresholded,
+      .f = function(.x, .y) {
+        specificity_vec(truth = factor(.x), estimate = factor(.y), event_level = "second")
+      }
+    )
+  ) |>
+  mutate(
+    training_CBI = map2(
+      .x = training_truth,
+      .y = training_meanpred,
+      .f = function(.x, .y) {
+        boyce_cont_vec(truth = factor(.x), estimate = .y, event_level = "second") # second because 0 then 1
+      }
+    ),
+    testing_CBI = map2(
+      .x = testing_truth,
+      .y = testing_meanpred,
+      .f = function(.x, .y) {
+        boyce_cont_vec(truth = factor(.x), estimate = .y, event_level = "second") # second because 0 then 1
+      }
+    ),
+    training_TSS = map2(
+      .x = training_truth,
+      .y = training_meanpred,
+      .f = function(.x, .y) {
+        tss_max_vec(truth = factor(.x), estimate = .y, event_level = "second") # second because 0 then 1
+      }
+    ),
+    testing_TSS = map2(
+      .x = testing_sensitivity,
+      .y = testing_specificity,
+      .f = function(.x, .y) {
+        .x + .y - 1
+      }
+    ),
+    testing_TSS_leak = map2(
+      .x = testing_truth,
+      .y = testing_meanpred,
+      .f = function(.x, .y) {
+        tss_max_vec(truth = factor(.x), estimate = .y, event_level = "second") # second because 0 then 1
+        ## this determines the TSS at a threshold internally based on testing data, so there is leakage 
+        ## the correct one is above
+      }
+    ),
+    training_ROC = map2(
+      .x = training_truth,
+      .y = training_meanpred,
+      .f = function(.x, .y) {
+        roc_auc_vec(truth = factor(.x), estimate = .y, event_level = "second") # second because 0 then 1
+      }
+    ),
+    testing_ROC = map2(
+      .x = testing_truth,
+      .y = testing_meanpred,
+      .f = function(.x, .y) {
+        roc_auc_vec(truth = factor(.x), estimate = .y, event_level = "second") # second because 0 then 1
+      }
+    )
+  ) |>
+  select(focal_species, model_type, training_N, testing_N, threshold, training_sensitivity:testing_ROC) |>
+  unnest(cols = everything())
+```
+
+```{r save-performance}
+write_csv(model_perf, here("output", "BART-eval", paste("BART", focal_species, "metrics.csv", sep = "_")))
+```
+
+## variable importance
+
+For both the reduced and full models, we extract variable importance metrics
+
+```{r varimp}
+varimp_tables <- tibble(
+  species = focal_species,
+  model_type = c("reduced", "unreduced"),
+  model = list(step_sdm, full_sdm),
+  rosetta = list(rosetta, rosetta)
+) |>
+  mutate(varimp = map2(
+    .x = model, .y = rosetta, .f = function(.x, .y) {
+      (.x$varcount / rowSums(.x$varcount)) |>
+        as_tibble() |>
+        pivot_longer(everything(), names_to = "predictors", values_to = "varimp") |>
+        group_by(predictors) |>
+        ggdist::mean_qi() |>
+        full_join(
+          .y |>
+            rbind(c("distance_to_cities", "distance to nearest city"))
+        )
+    }
+  )) |>
+  select(species, model_type, varimp) |>
+  unnest(cols = varimp) |>
+  arrange(model_type, predictors)
+```
+
+```{r save-varimp}
+write_csv(varimp_tables, here("output", "BART-eval", paste("BART", focal_species, "varimp.csv", sep = "_")))
+```
+
+# Generate the map layers
+
+We set things so that one geopackage is generated per species, with the predictions under different scenarios as layers within that gpkg.
+
+We first create the newdata on which we will predict. They're straightforwardly the whole set of sites (as opposed to only the sites used in training), but with the present-day climate variables replaced by their equivalent for the focal scenario
+
+```{r newdata-prep}
+newdata <- gridcells |>
+  select(any_of(rosetta$predictors), starts_with("CHELSA_bio"), distance_to_cities, geom) |>
+  na.omit() |>
+  mutate(distance_to_cities = mean(distance_to_cities))
+# we control for urban variation
+
+newdata_126_2041 <- newdata |>
+  mutate(
+    CHELSA_tas = CHELSA_bio1_2041_ssp126,
+    CHELSA_tasmax = CHELSA_bio5_2041_ssp126,
+    CHELSA_tasmin = CHELSA_bio6_2041_ssp126,
+    CHELSA_pr = CHELSA_bio12_2041_ssp126
+  )
+
+newdata_126_2071 <- newdata |>
+  mutate(
+    CHELSA_tas = CHELSA_bio1_2071_ssp126,
+    CHELSA_tasmax = CHELSA_bio5_2071_ssp126,
+    CHELSA_tasmin = CHELSA_bio6_2071_ssp126,
+    CHELSA_pr = CHELSA_bio12_2071_ssp126
+  )
+
+newdata_370_2041 <- newdata |>
+  mutate(
+    CHELSA_tas = CHELSA_bio1_2041_ssp370,
+    CHELSA_tasmax = CHELSA_bio5_2041_ssp370,
+    CHELSA_tasmin = CHELSA_bio6_2041_ssp370,
+    CHELSA_pr = CHELSA_bio12_2041_ssp370
+  )
+
+newdata_370_2071 <- newdata |>
+  mutate(
+    CHELSA_tas = CHELSA_bio1_2071_ssp370,
+    CHELSA_tasmax = CHELSA_bio5_2071_ssp370,
+    CHELSA_tasmin = CHELSA_bio6_2071_ssp370,
+    CHELSA_pr = CHELSA_bio12_2071_ssp370
+  )
+
+newdata_585_2041 <- newdata |>
+  mutate(
+    CHELSA_tas = CHELSA_bio1_2041_ssp585,
+    CHELSA_tasmax = CHELSA_bio5_2041_ssp585,
+    CHELSA_tasmin = CHELSA_bio6_2041_ssp585,
+    CHELSA_pr = CHELSA_bio12_2041_ssp585
+  )
+
+newdata_585_2071 <- newdata |>
+  mutate(
+    CHELSA_tas = CHELSA_bio1_2071_ssp585,
+    CHELSA_tasmax = CHELSA_bio5_2071_ssp585,
+    CHELSA_tasmin = CHELSA_bio6_2071_ssp585,
+    CHELSA_pr = CHELSA_bio12_2071_ssp585
+  )
+```
+
+```{r newdata-combine}
+preds_prep <- model_perf_0 |>
+  select(focal_species, model_type, model, threshold) |>
+  expand_grid(
+    tibble(
+      scenario = c("present", rep(c("ssp126", "ssp370", "ssp585"), 2)),
+      period = c("present", rep("2041-2070", 3), rep("2071-2100", 3)),
+      newdata = list(
+        newdata,
+        newdata_126_2041, newdata_370_2041, newdata_585_2041,
+        newdata_126_2071, newdata_370_2071, newdata_585_2071
+      )
+    )
+  )
+```
+
+We then go through every scenario and predict, then extract prediction mean and uncertainty for both the full odel...
+
+```{r preds-full}
+preds_full <- preds_prep |>
+  filter(model_type == "unreduced") |>
+  mutate(preds = map2(
+    .x = model, .y = newdata,
+    .f = function(.x, .y) {
+      p <- dbarts:::predict.bart(.x, newdata = .y)
+      ## three colons, because not exported (I always forget)
+      ## cols are grid_cells, rows are posterior samples
+      p_summarised <- tibble(posteriors = as.list(as.data.frame(p))) |>
+        mutate(preds_summary = map(.x = posteriors, .f = ~ .x |> ggdist::mean_qi())) |>
+        select(preds_summary) |>
+        unnest(cols = c(preds_summary)) |>
+        mutate(post_width = ymax - ymin) |>
+        select(post_mean = y, post_upper = ymax, post_lower = ymin, post_width) |>
+        mutate(geom = .y$geom)
+
+      return(p_summarised)
+    }
+  )) |>
+  unnest(cols = threshold) |>
+  select(-c(model, newdata, tss)) |>
+  rename(threshold = alpha)
+```
+
+... and the reduced model
+
+```{r preds-reduced}
+preds_reduced <- preds_prep |>
+  filter(model_type == "reduced") |>
+  mutate(preds = map2(
+    .x = model, .y = newdata,
+    .f = function(.x, .y) {
+      p <- dbarts:::predict.bart(.x, newdata = .y)
+      ## three colons, because not exported (I always forget)
+      ## cols are grid_cells, rows are posterior samples
+      p_summarised <- tibble(posteriors = as.list(as.data.frame(p))) |>
+        mutate(preds_summary = map(.x = posteriors, .f = ~ .x |> ggdist::mean_qi())) |>
+        select(preds_summary) |>
+        unnest(cols = c(preds_summary)) |>
+        mutate(post_width = ymax - ymin) |>
+        select(post_mean = y, post_upper = ymax, post_lower = ymin, post_width) |>
+        mutate(geom = .y$geom)
+
+      return(p_summarised)
+    }
+  )) |>
+  unnest(cols = threshold) |>
+  select(-c(model, newdata, tss)) |>
+  rename(threshold = alpha)
+```
+
+```{r final-formatting}
+final_reduced <- preds_reduced |>
+  mutate(species = focal_species) |>
+  group_by(focal_species, model_type, scenario, period) |>
+  nest() |>
+  mutate(export = map(.x = data, .f = function(.x) {
+    .x |> unnest(preds)
+  })) |>
+  select(-data)
+
+final_full <- preds_full |>
+  mutate(species = focal_species) |>
+  group_by(focal_species, model_type, scenario, period) |>
+  nest() |>
+  mutate(export = map(.x = data, .f = function(.x) {
+    .x |> unnest(preds)
+  })) |>
+  select(-data)
+```
+
+Finally, we loop through all the scenarios and save them as layers to the same geopackage
+
+```{r maps-write}
+for (i in 1:length(final_reduced$focal_species)) {
+  write_sf(
+    final_reduced$export[[i]],
+    here("output", "BART-maps", paste("DuneFront-WP4", final_reduced$focal_species[i], "BARTmaps_reduced_models.gpkg", sep = "_")),
+    layer = paste(final_reduced$focal_species[i], final_reduced$scenario[i], final_reduced$period[i], sep = "_")
+  )
+}
+
+for (i in 1:length(final_full$focal_species)) {
+  write_sf(
+    final_full$export[[i]],
+    here("output", "BART-maps", paste("DuneFront-WP4", final_full$focal_species[i], "BARTmaps_unreduced_models.gpkg", sep = "_")),
+    layer = paste(final_full$focal_species[i], final_full$scenario[i], final_full$period[i], sep = "_")
+  )
+}
+```
+
+# partial plots
+
+(we do these for the reduced model only)
+
+```{r partials-create}
+pplots <- embarcadero::partial(step_sdm,
+  trace = FALSE,
+  ci = TRUE,
+  ciwidth = 0.95,
+  smooth = 5, # to adjust
+  equal = TRUE
+)
+
+
+partials <- tibble(pplots) |>
+  mutate(predictors = map(.x = pplots, .f = function(.x) {
+    .x$labels$title
+  })) |>
+  unnest(predictors) |>
+  left_join(rosetta |> rbind(c("distance_to_cities", "distance to nearest city")))
+
+saveRDS(partials, here("output", "BART-eval", paste("BART", focal_species, "partials_reducedmodel.RDS", sep = "_")))
+
+partials <- readRDS(here("output", "BART-eval", paste("BART", focal_species, "partials_reducedmodel.RDS", sep = "_")))
+```
+
+```{r partials-show}
+for (i in 1:dim(partials)[1]) {
+  p <- partials$pplots[[i]]
+  plot(p + ggtitle(partials$full_name[[i]]))
+}
+```

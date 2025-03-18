@@ -1,0 +1,366 @@
+---
+title: "making info plots about BART models"
+format: html
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r load-packages}
+library(ggdist)
+library(ggtext)
+library(ggh4x)
+library(patchwork)
+library(sf)
+library(tidyverse)
+library(here)
+```
+
+This is code to generate various plots used in the DuneFront deliverable 4.2 report
+
+# 1: evaluate model performance
+
+```{r Nrecords}
+Nrecords <- read_csv(here("data", "DuneFront_WP4.2_formatted_occurrences_classicalSDM.csv")) |>
+  mutate_if(is.logical, as.numeric) |>
+  select(Calamagrostis_arenaria:Rosa_rugosa) |>
+  pivot_longer(everything(), names_to = "species") |>
+  group_by(species) |>
+  summarise(Nrecords = sum(value))
+
+Nrecords
+```
+
+```{r get-metrics0}
+tab <- tibble(
+  filename = list.files(here("output", "BART-eval"), pattern = "_metrics.csv"),
+  filepath = list.files(here("output", "BART-eval"), pattern = "_metrics.csv", full.names = TRUE)
+) |> 
+  filter(!str_detect(filename,"Carpobrotus_complex"))
+```
+
+```{r get-maps}
+tab_maps <- tibble(
+  filename = list.files(here("output", "BART-maps"), pattern = "_reduced.models.gpkg"),
+  filepath = list.files(here("output", "BART-maps"), pattern = "_reduced.models.gpkg", full.names = TRUE)
+) |> 
+  filter(!str_detect(filename,"Carpobrotus_complex"))|> 
+  mutate(
+  species = filename |>
+    str_remove("DuneFront-WP4_") |>
+    str_remove("_BARTmaps_reduced_models.gpkg"),
+  .before = 0
+)
+```
+
+```{r get-avg-prob}
+bart_probs <- tab_maps |>
+  mutate(avg_prob = map2(
+    .x = filepath, .y = species,
+    .f = function(.x, .y) {
+      read_sf(.x, layer = paste0(.y, "_present_present")) |>
+        as_tibble() |>
+        summarise(avg_prob = mean(post_mean > threshold))
+    }
+  )) |>
+  select(species, avg_prob) |>
+  unnest(cols = avg_prob)
+```
+
+```{r get-metrics1}
+tab_metrics <- tab |>
+  mutate(
+    metrics = map(
+      .x = filepath,
+      .f = function(.x) {
+        read_csv(.x, )
+      }
+    )
+  ) |>
+  unnest(metrics) |>
+  mutate(species = focal_species) |>
+  left_join(Nrecords) |>
+  left_join(bart_probs) |>
+  filter(model_type == "reduced")
+```
+
+As this stage we have a table that contains for each species, performance metrics, number of records and a measure of whether it is common or rare, the average probability across the map that its mean suitability> discretization threshold. We can use that to do various plots, we'll present the exemple of the continuous boyce index below
+
+```{r plot-boyce}
+tt <- tab_metrics |>
+  select(species, avg_prob, Nrecords, testing_CBI, training_CBI) |>
+  pivot_longer(cols = c(testing_CBI, training_CBI)) |>
+  mutate(
+    metric = str_split_fixed(name, "_", 2)[, 2],
+    `data split` = str_split_fixed(name, "_", 2)[, 1] |> fct_rev()
+  )
+
+p1 <- tt |>
+  ggplot() +
+  geom_segment(data = tab_metrics, aes(x = avg_prob, y = testing_CBI, yend = training_CBI), col = "grey30") +
+  geom_point(aes(avg_prob, value, col = `data split`)) +
+  scale_x_continuous("predicted proportion of occupied sites") +
+  scale_y_continuous("continuous Boyce index") +
+  theme_bw() +
+  theme(axis.title.y = element_markdown())
+
+p2 <- tt |>
+  ggplot() +
+  geom_segment(data = tab_metrics, aes(x = Nrecords, y = testing_CBI, yend = training_CBI), col = "grey30") +
+  geom_point(aes(Nrecords, value, col = `data split`)) +
+  scale_x_continuous("number of presence records") +
+  scale_y_continuous("continuous Boyce index") +
+  theme_bw() +
+  theme(axis.title.y = element_markdown())
+
+(p1 | p2) + plot_layout(axis_titles = "collect", guides = "collect")
+```
+
+```{r cor-check}
+cor.test(tab_metrics$Nrecords, tab_metrics$avg_prob)
+```
+
+# 2: map uncertainty
+
+```{r map-info}
+tab_maps <- tibble(
+  filename = list.files(here("output", "BART-maps"), pattern = "_reduced.models.gpkg"),
+  filepath = list.files(here("output", "BART-maps"), pattern = "_reduced.models.gpkg", full.names = TRUE)
+) |>
+  filter(!str_detect(filename,"Carpobrotus_complex")) |> 
+  mutate(
+  species = filename |>
+    str_remove("DuneFront-WP4_") |>
+    str_remove("_BARTmaps_reduced_models.gpkg"),
+  .before = 0
+)
+
+species_groups <- read_csv(here("data", "DuneFront_WP4.2_species_groups.csv"))
+```
+
+```{r read-maps}
+bart_uncert <- tab_maps |>
+  mutate(mapvars = map2(
+    .x = filepath, .y = species,
+    .f = function(.x, .y) {
+      read_sf(.x, layer = paste0(.y, "_present_present")) |>
+        as_tibble() |>
+        select(post_mean, post_width, threshold)
+    }
+  )) |>
+  select(species, mapvars) |>
+  unnest(cols = mapvars) |>
+  left_join(species_groups)
+```
+
+here for each species, we draw boxplots of the posterior width, that is the prediction uncertainty, depending on whether posterior mean is above or below the discretization threshold (i.e. whether we'd expect to be in more suitable vs. less suitable part of the range)
+
+```{r plot-uncertainty}
+bart_uncert |>
+  mutate(species = str_replace(species, "_", " ")) |>
+  mutate(species = paste0("*", species, "*")) |>
+  ggplot() +
+  geom_boxplot(aes(post_width, fct_rev(species), col = post_mean > threshold)) +
+  facet_grid(rows = vars((group)), space = "free_y", scales = "free_y") +
+  scale_x_continuous("Posterior uncertainty (95% credible interval width)") +
+  scale_y_discrete("") +
+  scale_color_discrete("Posterior mean suitability > threshold") +
+  theme_bw() +
+  theme(
+    legend.position = "bottom",
+    strip.text.y.right = element_text(angle = 0),
+    axis.text.y = element_markdown()
+  )
+```
+
+# 3: partial dependence plots
+
+```{r get-info}
+tab <- tibble(
+  filename = list.files(here("output", "BART-eval"), pattern = "_partials_reducedmodel.RDS"),
+  filepath = list.files(here("output", "BART-eval"), pattern = "_partials_reducedmodel.RDS", full.names = TRUE)
+)|> 
+  filter(!str_detect(filename,"Carpobrotus_complex"))
+```
+
+```{r load-plots}
+pp <- tab |>
+  mutate(plots = map(.x = filepath, .f = ~ .x |> readRDS()))|> 
+  unnest(cols = plots) |>
+  mutate(species = str_remove(filename, "BART_") |>
+    str_remove("_partials_reducedmodel.RDS")) |>
+  select(species, pplots, predictors, full_name)
+```
+
+## make an example patchwork
+
+```{r example-cakile}
+tt <- pp |> filter(species == "Cakile_maritima" & predictors %in% c("CHELSA_tasmax", "CHELSA_tasmin", "distance_closest", "CHELSA_pr"))
+
+p1 <- plot(tt$pplots[[1]] + ggtitle(tt$full_name[1]))
+p2 <- plot(tt$pplots[[2]] + ggtitle(tt$full_name[2]))
+p3 <- plot(tt$pplots[[3]] + ggtitle(tt$full_name[3]))
+p4 <- plot(tt$pplots[[4]] + ggtitle(tt$full_name[4]))
+
+(p1 + p2) / (p3 + p4) & theme_bw()
+```
+
+There are a lot of plots, so displaying all of them in the report would be unwieldy. What we will do instead is a summary table.
+We examine all the plots by batches...
+
+```{r look-plots}
+for (i in 161:187) {
+  plot(pp$pplots[[i]] + ggtitle(paste(pp$species[i], pp$predictors[i])))
+}
+```
+... and from that decided for each species * variable combination whether the pattern looked more increasing, decreasing, flat, bell or U shaped. We saved these calls into `BART-eval/partial_summaries.csv`
+
+We can then load them to make a nice summary plot
+
+```{r load-plot-summaries}
+species_groups <- read_csv(here("data", "DuneFront_WP4.2_species_groups.csv"))
+
+partial_summaries <- read_csv(here("output", "BART-eval", "partial_summaries.csv")) |>
+  pivot_longer(-species) |>
+  left_join(species_groups) |>
+  mutate(species = str_replace(species, "_", " ")) |>
+  mutate(species = paste0("*", species, "*")) |>
+  expand_grid(x = (-10:10) / 20) |>
+  mutate(y = case_when(
+    is.na(value) ~ NA_real_,
+    value == "bell" ~ 2 * (-x^2) + 0.25,
+    value == "U" ~ 2 * (x^2) - 0.25,
+    value == "flat" ~ 0,
+    value == "increase" ~ x / 2,
+    value == "decrease" ~ -x / 2,
+    TRUE ~ 0 ## catches the coastal orientation special case
+  ))
+```
+
+```{r reorder-predictors}
+predictors_group <-
+  tibble(
+    name = c("Astro_tide", "Coastal_orientation", "Distance_to_cities", "Distance_to_nearest_coast", "pr", "Shoreline_trend", "Storm_surge", "tas", "tasmin", "tasmax", "Tide_range", "Wave_height", "Wave_period", "wind", "windmax"),
+    full_name = c("highest astronomical tide", "coastal orientation", "distance to nearest city", "distance to closest shore", "annual precipitation", "shoreline trend", "100-year return storm surge", "avg. daily temperature", "avg. min. temperature of coldest month", "avg. max. temperature of warmest month", "tide range", "wave height", "wave period", "avg. wind speed", "avg. wind speed of windiest month"),
+    order = c(7, 1, 15, 3, 12, 2, 4, 9, 10, 11, 8, 5, 6, 13, 14)
+  ) |>
+  arrange(order) |>
+  mutate(full_name = factor(full_name, levels = unique(full_name[order(order)])))
+```
+
+```{r plot-summaries}
+ggplot(left_join(partial_summaries, predictors_group)) +
+  geom_line(aes(x, y), linewidth = 1) +
+  scale_x_continuous("", lim = c(-0.7, 0.7)) +
+  scale_y_continuous("", lim = c(-0.30, 0.30)) +
+  facet_nested(cols = vars(full_name), rows = vars(group, species), switch = "y") +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(), axis.text = element_blank(), axis.ticks = element_blank(),
+    panel.border = element_rect(colour = "darkgrey"),
+    # panel.background = element_rect(fill="lightgrey",colour="lightgrey"),
+    strip.text.y.left = element_markdown(angle = 0), ,
+    strip.text.x = element_text(angle = 90)
+  )
+```
+
+
+# 4: evaluate shifts in future scenarios
+
+```{r get-info-future}
+no_analogs <- read_sf(here("output", "BART-maps", "DuneFront-WP4_no-analog_maps.gpkg"))
+
+tab_maps <- tibble(
+  filename = list.files(here("output", "BART-maps"), pattern = "_reduced.models.gpkg"),
+  filepath = list.files(here("output", "BART-maps"), pattern = "_reduced.models.gpkg", full.names = TRUE)
+) |> 
+  filter(!str_detect(filename,"Carpobrotus_complex"))|>
+  mutate(
+    species = filename |>
+      str_remove("DuneFront-WP4_") |>
+      str_remove("_BARTmaps_reduced_models.gpkg"),
+    .before = 0
+  ) |>
+  expand_grid(
+    layer_suffix = c("_present_present", "_ssp126_2041-2070", "_ssp126_2071-2100")
+  ) |>
+  mutate(layer_name = paste0(species, layer_suffix))
+```
+
+
+```{r load-future}
+tt <- tab_maps |>
+  mutate(post_mean = map2(
+    .x = filepath, .y = layer_name,
+    .f = function(.x, .y) {
+      read_sf(.x, layer = .y) |>
+        select(post_mean)
+    }
+  )) |>
+  select(species, layer_suffix, post_mean) |>
+  mutate(no_analogs = list(no_analogs)) |>
+  mutate(post_mean = map2(
+    .x = post_mean, .y = no_analogs,
+    .f = function(.x, .y) {
+      x <- st_centroid(.x) |>
+        mutate(
+          x = st_coordinates(geom)[, 1],
+          y = st_coordinates(geom)[, 2]
+        ) |>
+        as_tibble() |>
+        select(-geom)
+
+      y <- st_centroid(.y) |>
+        mutate(
+          x = st_coordinates(geom)[, 1],
+          y = st_coordinates(geom)[, 2]
+        ) |>
+        as_tibble()
+
+      left_join(x, y) |> select(-geom)
+    }
+  )) |>
+  select(-no_analogs)
+```
+
+```{r make-barplot}
+tt |>
+  pivot_wider(names_from = layer_suffix, values_from = post_mean) |>
+  mutate(
+    diff_2041 = map2(
+      .x = `_present_present`, .y = `_ssp126_2041-2070`,
+      .f = function(.x, .y) {
+        x <- .x |> filter(no_analog_any_2041_ssp126 == FALSE) # can comment out the |> and everything after to include no-analog sites in comparison
+        y <- .y |> filter(no_analog_any_2041_ssp126 == FALSE) # can comment out the |> and everything after to include no-analog sites in comparison
+        (sum(y$post_mean) - sum(x$post_mean)) / sum(x$post_mean)
+      }
+    ),
+    diff_2071 = map2(
+      .x = `_present_present`, .y = `_ssp126_2071-2100`,
+      .f = function(.x, .y) {
+        x <- .x |> filter(no_analog_any_2071_ssp126 == FALSE) # can comment out the |> and everything after to include no-analog sites in comparison
+        y <- .y |> filter(no_analog_any_2071_ssp126 == FALSE) # can comment out the |> and everything after to include no-analog sites in comparison
+        (sum(y$post_mean) - sum(x$post_mean)) / sum(x$post_mean)
+      }
+    )
+  ) |>
+  select(species, diff_2041, diff_2071) |>
+  unnest(cols = c(diff_2041, diff_2071)) |>
+  pivot_longer(cols = -species) |>
+  left_join(species_groups) |>
+  mutate(scenario = case_when(
+    name == "diff_2041" ~ "2041-2070, SSP1-RCP2.6",
+    name == "diff_2071" ~ "2071-2100, SSP1-RCP2.6"
+  )) |>
+  mutate(species = str_replace(species, "_", " ")) |>
+  mutate(species = paste0("*", species, "*")) |>
+  ggplot() +
+  geom_col(aes(value * 100, fct_rev(species))) +
+  facet_grid(cols = vars(scenario), rows = vars(group), scales = "free_y", space = "free") +
+  scale_x_continuous("avg. % change in suitability probability from present") +
+  scale_y_discrete("") +
+  theme_bw() +
+  theme(
+    axis.text.y = element_markdown(),
+    strip.text.y.right = element_text(angle = 0)
+  )
+```
